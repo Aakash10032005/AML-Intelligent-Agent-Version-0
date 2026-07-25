@@ -159,6 +159,7 @@ def clarification_node(state: AgentState):
 
 
 # 5. Pipeline Node: Execute Planned Tools
+# 5. Pipeline Node: Execute Planned Tools
 def execute_tools_node(state: AgentState):
     plan = state.get("plan", {})
     tools_to_run = plan.get("tools_to_invoke", [])
@@ -167,8 +168,17 @@ def execute_tools_node(state: AgentState):
 
     acc_id = filters.get("account_id")
     date_range = filters.get("date_range", {}) if isinstance(filters.get("date_range"), dict) else {}
-    date_start = date_range.get("start")
-    date_end = date_range.get("end")
+    
+    # Safely convert None values to empty strings or valid types to prevent Pydantic validation errors
+    date_start = date_range.get("start") if date_range.get("start") else "2023-01-01"
+    date_end = date_range.get("end") if date_range.get("end") else "2025-12-31"
+    
+    # If explicit nulls were returned by the LLM planner, set them to safe defaults or omit them
+    if date_start == "null" or date_start is None:
+        date_start = "2023-01-01"
+    if date_end == "null" or date_end is None:
+        date_end = "2025-12-31"
+
     amount_min = filters.get("amount_min")
     amount_max = filters.get("amount_max")
     min_tx_count = filters.get("min_transaction_count")
@@ -176,26 +186,36 @@ def execute_tools_node(state: AgentState):
 
     outputs = []
 
-    # Modular execution of invoked tools, with planner filters threaded through
+    # Modular execution of invoked tools, with safe arguments threaded through
     if "eda" in tools_to_run:
         outputs.append(
             "--- EDA MODULE OUTPUT ---\n" +
-            run_eda_tool.invoke({"query": "all", "date_start": date_start, "date_end": date_end})
+            run_eda_tool.invoke({
+                "query": "all", 
+                "date_start": str(date_start), 
+                "date_end": str(date_end)
+            })
         )
 
     if "feature_engineering" in tools_to_run:
-        param = acc_id if acc_id else "all"
+        param = acc_id if acc_id and acc_id != "null" else "all"
+        fe_args = {
+            "account_id": param,
+            "date_start": str(date_start),
+            "date_end": str(date_end),
+        }
+        if amount_min is not None and amount_min != "null":
+            fe_args["amount_min"] = float(amount_min)
+        if amount_max is not None and amount_max != "null":
+            fe_args["amount_max"] = float(amount_max)
+        if tx_type and tx_type != "null":
+            fe_args["transaction_type"] = str(tx_type)
+        if min_tx_count is not None and min_tx_count != "null":
+            fe_args["min_transaction_count"] = int(min_tx_count)
+
         outputs.append(
             "--- FEATURE ENGINEERING OUTPUT ---\n" +
-            feature_engineering_tool.invoke({
-                "account_id": param,
-                "date_start": date_start,
-                "date_end": date_end,
-                "amount_min": amount_min,
-                "amount_max": amount_max,
-                "transaction_type": tx_type,
-                "min_transaction_count": min_tx_count,
-            })
+            feature_engineering_tool.invoke(fe_args)
         )
 
     if "pattern_detection" in tools_to_run:
@@ -203,26 +223,29 @@ def execute_tools_node(state: AgentState):
             outputs.append(
                 "--- LAYERING PATTERN DETECTION OUTPUT ---\n" +
                 detect_layering_tool.invoke({
-                    "query": "all", "date_start": date_start, "date_end": date_end
+                    "query": "all", 
+                    "date_start": str(date_start), 
+                    "date_end": str(date_end)
                 })
             )
         else:
             outputs.append(
                 "--- STRUCTURING PATTERN DETECTION OUTPUT ---\n" +
                 detect_structuring_tool.invoke({
-                    "date_start": date_start, "date_end": date_end
+                    "date_start": str(date_start), 
+                    "date_end": str(date_end)
                 })
             )
 
     if "risk_classification" in tools_to_run:
-        param = acc_id if acc_id else "all"
+        param = acc_id if acc_id and acc_id != "null" else "all"
         outputs.append(
             "--- HYBRID RISK CLASSIFICATION OUTPUT ---\n" +
             risk_classification_tool.invoke({
                 "account_id": param,
-                "target_pattern": target_pattern,
-                "date_start": date_start,
-                "date_end": date_end,
+                "target_pattern": str(target_pattern),
+                "date_start": str(date_start),
+                "date_end": str(date_end),
             })
         )
 
