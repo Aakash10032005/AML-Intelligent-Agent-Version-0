@@ -1,15 +1,21 @@
 import os
-from typing import TypedDict
+import json
+from typing import TypedDict, List, Dict, Any, Optional
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
-# Import the analytical tools built in tools.py
-from tools import run_eda_tool, detect_structuring_tool, risk_scoring_tool
+# Import analytical tools from tools.py
+from tools import (
+    run_eda_tool,
+    feature_engineering_tool,
+    detect_structuring_tool,
+    detect_layering_tool,
+    risk_classification_tool
+)
 
-# Force dotenv to load the API key from .env file
 load_dotenv(override=True)
-api_key = os.getenv("GOOGLE_API_KEY")
+api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("google_api_key")
 
 if not api_key:
     raise ValueError("GOOGLE_API_KEY not found in environment variables. Check your .env file!")
@@ -17,130 +23,278 @@ if not api_key:
 # 1. State Definition
 class AgentState(TypedDict):
     user_query: str
-    identified_intent: str
-    tool_output: str
+    plan: Dict[str, Any]
+    needs_clarification: bool
+    clarifying_question: Optional[str]
+    tool_outputs: List[str]
+    invoked_tools: List[str]
+    skipped_tools: List[str]
     final_explanation: str
+    execution_summary: str
 
-# 2. Node: Parse Intent
-def parse_intent_node(state: AgentState):
-    """Uses Gemini to determine which analytical tool is required based on user intent."""
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-flash-latest", 
-        temperature=0, 
+# Helper to initialize LLM
+def get_llm():
+    return ChatGoogleGenerativeAI(
+        model="gemini-flash-latest",
+        temperature=0,
         google_api_key=api_key
     )
+
+# 2. Node: Dynamic Query Planner
+def parse_query_node(state: AgentState):
+    """
+    Parses the user query into a structured execution plan JSON object.
+    Determines intent, target pattern, filters, required modules, tools to invoke, and skip reasons.
+    """
+    llm = get_llm()
     
     prompt = f"""
-    Analyze the following user query and determine the exact intent.
-    Return ONLY ONE of these three exact strings:
-    - 'eda' (if they want broad summaries, data exploration, or baseline statistics)
-    - 'structuring' (if they want to find smurfing, structuring, patterns, or evasion)
-    - 'single_entity' (if they ask about a specific customer ID or account)
+    You are an expert Anti-Money Laundering (AML) Compliance Agent and Planner.
+    Analyze the user's natural language query and construct a dynamic execution plan.
 
-    User Query: {state['user_query']}
+    Respond ONLY with a valid JSON object strictly matching this schema:
+    {{
+      "intent": "eda | pattern_detection | single_entity | aggregation_rule | comparison | insight_query",
+      "target_pattern": "structuring | smurfing | layering | none",
+      "filters": {{
+        "date_range": {{"start": "YYYY-MM-DD or null", "end": "YYYY-MM-DD or null"}},
+        "account_id": "string or null",
+        "transaction_type": "string or null",
+        "amount_min": "number or null",
+        "amount_max": "number or null",
+        "min_transaction_count": "number or null"
+      }},
+      "requires_eda": boolean,
+      "requires_feature_engineering": boolean,
+      "requires_anomaly_detection": boolean,
+      "requires_risk_classification": boolean,
+      "tools_to_invoke": ["ordered list of tool names from: eda, feature_engineering, pattern_detection, risk_classification"],
+      "needs_clarification": boolean,
+      "clarifying_question": "string or null (ask clarifying question if query is completely ambiguous or lacks necessary context)",
+      "reasoning": "one sentence explaining why these specific tools were chosen and why others were skipped"
+    }}
+
+    FEW-SHOT EXAMPLES:
+    Example 1: "Find structuring patterns in the last 30 days"
+    -> intent: "pattern_detection", target_pattern: "structuring", filters: {{date_range: {{start: "2025-06-25", end: "2025-07-25"}}}}, requires_eda: false, requires_feature_engineering: true, requires_anomaly_detection: true, requires_risk_classification: true, tools_to_invoke: ["feature_engineering", "pattern_detection", "risk_classification"], needs_clarification: false, reasoning: "Targeted pattern detection query skips broad EDA to focus on feature extraction, structuring detection, and risk scoring."
+
+    Example 2: "Which customers made 10+ transactions under $10,000?"
+    -> intent: "aggregation_rule", target_pattern: "none", filters: {{amount_max: 10000, min_transaction_count: 10}}, requires_eda: false, requires_feature_engineering: true, requires_anomaly_detection: false, requires_risk_classification: false, tools_to_invoke: ["feature_engineering"], needs_clarification: false, reasoning: "Deterministic threshold aggregation query requires feature engineering to count sub-10k transfers, skipping ML anomaly detection."
+
+    Example 3: "Is customer ID ACC_SMURF_9003 suspicious?"
+    -> intent: "single_entity", target_pattern: "none", filters: {{account_id: "ACC_SMURF_9003"}}, requires_eda: false, requires_feature_engineering: true, requires_anomaly_detection: true, requires_risk_classification: true, tools_to_invoke: ["feature_engineering", "risk_classification"], needs_clarification: false, reasoning: "Single-entity lookup extracts targeted account features and evaluates hybrid risk classification."
+
+    Example 4: "Analyze transactions"
+    -> needs_clarification: true, clarifying_question: "Could you please specify whether you want a broad baseline EDA summary, a scan for structuring/layering patterns, or a risk score for a specific Account ID?"
+
+    User Query: "{state['user_query']}"
     """
-    response = llm.invoke(prompt)
-    intent = str(response.content).strip().lower()
     
-    # Fallback safety routing logic
-    if 'single_entity' in intent: 
-        intent = 'single_entity'
-    elif 'structuring' in intent: 
-        intent = 'structuring'
-    else: 
-        intent = 'eda'
+    try:
+        response = llm.invoke(prompt)
+        content = response.content.strip()
         
-    return {"identified_intent": intent}
+        # Clean JSON markdown fences if present
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
+        
+        plan = json.loads(content)
+    except Exception:
+        # Fallback plan if JSON parsing fails
+        plan = {
+            "intent": "eda",
+            "target_pattern": "none",
+            "filters": {},
+            "requires_eda": True,
+            "requires_feature_engineering": False,
+            "requires_anomaly_detection": False,
+            "requires_risk_classification": False,
+            "tools_to_invoke": ["eda"],
+            "needs_clarification": False,
+            "clarifying_question": None,
+            "reasoning": "Fallback routing to baseline EDA due to unparseable response."
+        }
 
-# 3. Conditional Routing Function
-def route_to_tool(state: AgentState):
-    """Tells LangGraph which tool node to execute based on identified intent."""
-    return state['identified_intent']
+    all_possible = ["eda", "feature_engineering", "pattern_detection", "risk_classification"]
+    invoked = plan.get("tools_to_invoke", [])
+    skipped = [t for t in all_possible if t not in invoked]
 
-# 4. Nodes: Tool Execution
-def execute_eda_node(state: AgentState):
-    output = run_eda_tool.invoke({"query": "all"})
-    return {"tool_output": output}
+    return {
+        "plan": plan,
+        "needs_clarification": plan.get("needs_clarification", False),
+        "clarifying_question": plan.get("clarifying_question"),
+        "invoked_tools": invoked,
+        "skipped_tools": skipped,
+        "tool_outputs": []
+    }
 
-def execute_structuring_node(state: AgentState):
-    output = detect_structuring_tool.invoke({"timeframe": "30 days"})
-    return {"tool_output": output}
+# 3. Router Edge Function
+def route_after_parse(state: AgentState):
+    """Routes execution based on whether human clarification is needed or tool execution should start."""
+    if state.get("needs_clarification", False):
+        return "human_clarification"
+    return "execute_tools_pipeline"
 
-def execute_single_entity_node(state: AgentState):
-    """Extracts entity identifier using Gemini and runs the risk scoring engine."""
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-flash-latest", 
-        temperature=0, 
-        google_api_key=api_key
-    )
-    id_prompt = f"Extract only the exact Account ID from this query. Example output: 'ACC_1234' or 'ACC_SMURF_9999'. Query: {state['user_query']}"
-    acc_id = str(llm.invoke(id_prompt).content).strip()
-    
-    output = risk_scoring_tool.invoke({"account_id": acc_id})
-    return {"tool_output": output}
+# 4. Node: Human-in-the-loop Clarification
+def clarification_node(state: AgentState):
+    question = state.get("clarifying_question") or "Could you please clarify your request?"
+    explanation = f"### ⚠️ Clarification Needed\n\n{question}"
+    return {
+        "final_explanation": explanation,
+        "execution_summary": f"**QUERY**: \"{state['user_query']}\"\n**STATUS**: Awaiting Clarification (Ambiguous Input)"
+    }
 
-# 5. Node: Explanation and Escalation
+# 5. Pipeline Node: Execute Planned Tools
+def execute_tools_node(state: AgentState):
+    plan = state.get("plan", {})
+    tools_to_run = plan.get("tools_to_invoke", [])
+    filters = plan.get("filters", {})
+    target_pattern = plan.get("target_pattern", "none")
+    acc_id = filters.get("account_id") if isinstance(filters, dict) else None
+
+    outputs = []
+
+    # Modular execution of invoked tools
+    if "eda" in tools_to_run:
+        outputs.append(f"--- EDA MODULE OUTPUT ---\n" + run_eda_tool.invoke({"query": "all"}))
+        
+    if "feature_engineering" in tools_to_run:
+        param = acc_id if acc_id else "all"
+        outputs.append(f"--- FEATURE ENGINEERING OUTPUT ---\n" + feature_engineering_tool.invoke({"account_id": param}))
+        
+    if "pattern_detection" in tools_to_run:
+        if target_pattern == "layering":
+            outputs.append(f"--- LAYERING PATTERN DETECTION OUTPUT ---\n" + detect_layering_tool.invoke({"query": "all"}))
+        else:
+            outputs.append(f"--- STRUCTURING PATTERN DETECTION OUTPUT ---\n" + detect_structuring_tool.invoke({"timeframe": "30 days"}))
+
+    if "risk_classification" in tools_to_run:
+        param = acc_id if acc_id else "all"
+        outputs.append(f"--- HYBRID RISK CLASSIFICATION OUTPUT ---\n" + risk_classification_tool.invoke({"account_id": param, "target_pattern": target_pattern}))
+
+    return {"tool_outputs": outputs}
+
+# 6. Node: Query-Aware Compliance Memorandum Generator
 def explanation_node(state: AgentState):
-    """Translates tool output into clear AML compliance narratives and recommendations."""
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-flash-latest", 
-        temperature=0, 
-        google_api_key=api_key
-    )
+    plan = state.get("plan", {})
+    tools_invoked = state.get("invoked_tools", [])
+    tools_skipped = state.get("skipped_tools", [])
+    outputs = "\n\n".join(state.get("tool_outputs", []))
+    
+    llm = get_llm()
+    
     prompt = f"""
-    You are a bank compliance officer. Based on the user's original query and the tool's raw output, 
-    generate a human-readable explanation of why a flag occurred and recommend a basic escalation action (monitor, review, or report).
-    
-    Original Query: {state['user_query']}
-    Tool Output: {state['tool_output']}
-    
-    Provide the response using professional formatting and bullet points.
-    """
-    response = llm.invoke(prompt)
-    return {"final_explanation": str(response.content)}
+    You are a Senior Bank AML Compliance Officer preparing a formal Incident Memorandum.
+    Synthesize the original query, dynamic execution plan, and tool analytical outputs into a professional regulatory memorandum.
 
-# --- BUILD THE LANGGRAPH WORKFLOW ---
+    Original Query: "{state['user_query']}"
+    Planner Intent: {plan.get('intent')}
+    Target Typology: {plan.get('target_pattern')}
+    Invoked Tools: {', '.join(tools_invoked)}
+    Raw Tool Outputs:
+    {outputs}
+
+    REQUIREMENTS:
+    1. Tie every narrative observation back to the original user query and identified target pattern.
+    2. Outline specific account flags, amounts, and statistical anomaly indicators.
+    3. Conclude with an explicit, auditable Escalation Recommendation based on risk severity:
+       - HIGH RISK -> Recommend immediate SAR (Suspicious Activity Report) filing with FinCEN.
+       - MEDIUM RISK -> Recommend placing under 30-day Enhanced Due Diligence (EDD) monitoring.
+       - LOW RISK -> Recommend standard monitoring with no immediate escalation.
+    4. Format using clean GitHub-style Markdown with clear headings and bullet points.
+    """
+    
+    try:
+        res = llm.invoke(prompt)
+        explanation_text = res.content
+        if isinstance(explanation_text, list):
+            text_content = ""
+            for block in explanation_text:
+                if isinstance(block, dict) and "text" in block:
+                    text_content += block["text"]
+            explanation_text = text_content if text_content else str(explanation_text)
+    except Exception as e:
+        explanation_text = f"### AML Incident Analysis Summary\n\n**Query Analyzed**: {state['user_query']}\n\n**Tool Output Analysis**:\n{outputs}\n\n**Escalation Recommendation**: Review high-risk accounts and assess for SAR filing with FinCEN."
+
+    # Format Query-Aware Execution Summary Header
+    summary_header = format_execution_summary(state)
+    
+    return {
+        "final_explanation": str(explanation_text),
+        "execution_summary": summary_header
+    }
+
+# Helper: Build Query-Aware Execution Summary
+def format_execution_summary(state: AgentState) -> str:
+    plan = state.get("plan", {})
+    intent = plan.get("intent", "Unknown")
+    pattern = plan.get("target_pattern", "none")
+    filters = plan.get("filters", {})
+    invoked = state.get("invoked_tools", [])
+    skipped = state.get("skipped_tools", [])
+    reasoning = plan.get("reasoning", "N/A")
+
+    filters_str = json.dumps(filters) if filters else "None"
+    invoked_str = " -> ".join(invoked) if invoked else "None"
+    skipped_str = ", ".join(skipped) if skipped else "None"
+
+    return f"""```text
+QUERY: "{state['user_query']}"
+DETECTED INTENT: {intent} (target_pattern: {pattern})
+FILTERS APPLIED: {filters_str}
+TOOLS INVOKED: {invoked_str}
+TOOLS SKIPPED: {skipped_str}
+PLANNER REASONING: {reasoning}
+```"""
+
+# --- BUILD LANGGRAPH WORKFLOW ---
 workflow = StateGraph(AgentState)
 
-# Add all process nodes
-workflow.add_node("parse_intent", parse_intent_node)
-workflow.add_node("execute_eda", execute_eda_node)
-workflow.add_node("execute_structuring", execute_structuring_node)
-workflow.add_node("execute_single_entity", execute_single_entity_node)
+# Add Nodes
+workflow.add_node("parse_query", parse_query_node)
+workflow.add_node("human_clarification", clarification_node)
+workflow.add_node("execute_tools_pipeline", execute_tools_node)
 workflow.add_node("generate_explanation", explanation_node)
 
-# Set the start node
-workflow.set_entry_point("parse_intent")
+# Set Entry Point
+workflow.set_entry_point("parse_query")
 
-# Add conditional routing edges
+# Add Conditional Edges
 workflow.add_conditional_edges(
-    "parse_intent",
-    route_to_tool,
+    "parse_query",
+    route_after_parse,
     {
-        "eda": "execute_eda",
-        "structuring": "execute_structuring",
-        "single_entity": "execute_single_entity"
+        "human_clarification": "human_clarification",
+        "execute_tools_pipeline": "execute_tools_pipeline"
     }
 )
 
-# Connect execution nodes to the final explanation generator
-workflow.add_edge("execute_eda", "generate_explanation")
-workflow.add_edge("execute_structuring", "generate_explanation")
-workflow.add_edge("execute_single_entity", "generate_explanation")
-
-# Terminate execution graph
+# Connect edges
+workflow.add_edge("execute_tools_pipeline", "generate_explanation")
+workflow.add_edge("human_clarification", END)
 workflow.add_edge("generate_explanation", END)
 
-# Compile agent executable
+# Compile Executable Graph
 aml_agent = workflow.compile()
 
 if __name__ == "__main__":
-    test_query = "Find structuring patterns in the last 30 days"
-    print(f"Testing Query: {test_query}\n" + "-"*40)
+    import time
+    test_queries = [
+        "Find structuring patterns in the last 30 days",
+        "Which customers made 10+ transactions under $10,000?",
+        "Is customer ID ACC_SMURF_9003 suspicious?"
+    ]
     
-    # Execute graph
-    result = aml_agent.invoke({"user_query": test_query})
-    
-    print(f"Agent's Routing Decision: Routed to {result['identified_intent']} tool.")
-    print("\n--- FINAL COMPLIANCE EXPLANATION ---")
-    print(result['final_explanation'])
+    for query in test_queries:
+        print(f"\n" + "="*60)
+        print(f"TESTING QUERY: {query}")
+        print("="*60)
+        
+        result = aml_agent.invoke({"user_query": query})
+        print(result['execution_summary'])
+        print("\n--- INCIDENT MEMORANDUM ---")
+        print(result['final_explanation'])
+        time.sleep(2)

@@ -1,102 +1,152 @@
-# 🏛️ Anti-Money Laundering (AML) Intelligent Surveillance Engine
+# 🏛️ Problem Statement 1: AI-Powered Suspicious Activity Detection Engine
 
-An autonomous, multi-tool AI Agent system built with **LangGraph**, **LangChain**, **Google Gemini**, and **Streamlit** to detect, investigate, and report suspicious transaction patterns (such as Structuring and Smurfing) for BSA/FinCEN regulatory compliance.
-
----
-
-## 📌 Project Overview & Achievements
-
-This repository contains a full-stack AML Surveillance & Incident Analysis solution designed to automate regulatory alert investigations.
-
-### 🌟 Key Capabilities:
-1. **Synthetic Data & Typology Injection**: Recreates retail banking transactions with injected money-laundering typologies.
-2. **Multi-Tool Analytical Suite**: Combines exploratory data analysis, rule-based threshold detectors, and machine learning anomaly detection.
-3. **LangGraph Autonomous Agent**: Orchestrates query intent classification, dynamic tool invocation, and compliance memorandum generation.
-4. **Interactive Executive Web UI**: High-contrast, dark-themed Streamlit dashboard for compliance officers.
+An autonomous, dynamic AI Agent system built with **LangGraph**, **LangChain**, **Google Gemini**, and **Streamlit** to detect, investigate, and report suspicious financial transaction patterns (such as Structuring/Smurfing and Layering) for BSA/FinCEN regulatory compliance.
 
 ---
 
-## 🛠️ Architecture & System Components
+## 📌 Problem Statement Overview
+Financial institutions generate millions of transaction alerts daily. Traditional compliance workflows rely on static rule thresholds or hardcoded sequential pipelines that lack adaptive reasoning. 
 
-### 1. Data Pipeline (`generate_data.py`)
-* **Function**: Generates realistic synthetic transaction records saved to `data/transactions.csv`.
-* **Typology Injected**: **Structuring / Smurfing**. Malicious actors execute 4-6 rapid transactions between **$9,000.00 and $9,999.99** within short timeframes (2-hour intervals) to bypass the $10,000 Currency Transaction Reporting (CTR) threshold under the Bank Secrecy Act (BSA).
-* **Schema**: `account_id`, `timestamp`, `amount`, `transaction_type`, `is_suspicious`, `pattern_type`.
-
-### 2. Analytical Tools (`tools.py`)
-* `run_eda_tool`: Computes baseline statistics, total volume, average transaction size, and initial data summaries.
-* `detect_structuring_tool`: Rule-based engine scanning for accounts conducting 3+ transactions in the $9,000–$9,999 evasion band.
-* `risk_scoring_tool`: Uses Scikit-Learn's `IsolationForest` ML model trained on account behavioral aggregations (`tx_count`, `avg_amount`, `max_amount`) to calculate anomaly scores and classify account risk.
-
-### 3. Autonomous LangGraph Agent (`agent.py`)
-* **Framework**: `langgraph.graph.StateGraph` & `ChatGoogleGenerativeAI`.
-* **Workflow Nodes**:
-  - `parse_intent_node`: Uses Google Gemini (`gemini-flash-latest`) to classify user queries into `eda`, `structuring`, or `single_entity`.
-  - `route_to_tool`: Conditional routing edge directing execution to the appropriate tool node.
-  - `execute_*_node`: Runs the selected analytical tool from `tools.py`.
-  - `explanation_node`: Translates raw tool metrics into formal compliance narratives, risk classifications, and recommended escalation actions (e.g., EDD Review, SAR Filing).
-
-### 4. Executive Surveillance Dashboard (`app.py`)
-* **Interface**: Streamlit dark-mode web application tailored for financial compliance analysts.
-* **Key Features**:
-  - Live metric summary cards (10k monitored transactions, $10k BSA threshold limit).
-  - Quick-Run investigation templates (Scan Structuring, Analyze Specific Account, General Overview).
-  - Clean text parser formatting Gemini outputs into readable compliance memoranda.
+This project implements an **Autonomous Dynamic Query Planner**. Rather than following a fixed, linear pipeline, the agent parses natural language queries, extracts structured intents and filters, dynamically constructs an execution plan, and invokes only the tools necessary to answer the specific query—logging skipped nodes and explaining its reasoning transparently.
 
 ---
 
-## 📁 Repository Structure
+## 📊 Dataset Information & Generation Logic
+
+This project utilizes a synthetic transaction dataset generated via `generate_data.py` (`data/transactions.csv`, 5,339 records).
+
+### Schema & Field Definitions:
+* `account_id` (String): Unique identifier for the customer account (e.g., `ACC_1042`, `ACC_SMURF_9003`, `ACC_LAYER_8012`).
+* `timestamp` (Datetime): Timestamp of the financial transaction.
+* `amount` (Float): Transaction value in USD.
+* `transaction_type` (String): Type of fund movement (`PAYMENT`, `TRANSFER`).
+* `is_suspicious` (Integer): Binary indicator (1 = Suspicious, 0 = Normal).
+* `pattern_type` (String): Ground-truth typology (`Normal`, `Structuring`, `Layering`).
+
+### Injected Typologies & Assumptions:
+1. **Structuring (Smurfing)**: Malicious actors execute 4–6 rapid transfers just under the $10,000 Currency Transaction Reporting (CTR) threshold (e.g., $9,000.00 to $9,999.99) within short timeframes (2-hour intervals) to evade BSA reporting requirements.
+2. **Layering (Rapid Pass-Through & Fan-Out)**: High-volume incoming transfers ($25,000–$75,000) immediately split and transferred out to multiple accounts within short windows to obscure money trails.
+
+### Dataset Citation & Reference:
+Transaction volume, velocity distributions, and evasion thresholds are modeled on publicly available **FinCEN Suspicious Activity Report (SAR) Stats** and synthetic money laundering benchmarks (inspired by Kaggle's *Synthetic Financial Datasets for Fraud Detection*).
+
+---
+
+## 🏗️ Solution Architecture & Dynamic Planning
+
+Unlike a fixed sequential pipeline, the core `agent.py` orchestrates execution via a dynamic JSON planner node (`parse_query_node`).
 
 ```text
-AML-Intelligent-Agent-Version-0/
-├── .env                  # Environment key configurations (GOOGLE_API_KEY)
-├── agent.py              # LangGraph workflow, nodes, and LLM setup
-├── app.py                # Streamlit web surveillance dashboard
-├── generate_data.py      # Synthetic transaction & typology generator
-├── tools.py              # LangChain analytical tools (EDA, Structuring, ML Risk Scoring)
-├── data/
-│   └── transactions.csv  # Synthetic dataset generated by generate_data.py
-├── test_key.py           # Diagnostic script for verifying Gemini API models
-└── README.md             # Project documentation
+               +----------------------------------+
+               |        User Natural Query        |
+               +----------------------------------+
+                                |
+                                v
+               +----------------------------------+
+               |   parse_query_node (Gemini LLM)   |
+               |  (Extracts Intent, Filters, Plan)|
+               +----------------------------------+
+                                |
+             +------------------+------------------+
+             |                                     |
+             v (Needs Clarification)               v (Valid Plan)
++-------------------------+             +--------------------------+
+|  clarification_node     |             | execute_tools_pipeline   |
+| (Human-in-the-Loop Exit)|             | (Dynamic Tool Fan-Out)   |
++-------------------------+             +--------------------------+
+             |                                     |
+             |       +-----------------------------+-----------------------------+
+             |       |                             |                             |
+             |       v                             v                             v
+             |  [eda_tool]            [feature_engineering_tool]  [pattern_detection_tool]
+             |  (Skipped if targeted) (Per-Account Aggregations)   (Structuring/Layering)
+             |       |                             |                             |
+             |       +-----------------------------+-----------------------------+
+             |                                     |
+             |                                     v
+             |                         [risk_classification_tool]
+             |                         (Hybrid ML + Rule Scoring)
+             |                                     |
+             v                                     v
++----------------------------------------------------------------------------------+
+|                            explanation_node                                      |
+|            (Generates Execution Summary + BSA Incident Memorandum)               |
++----------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 🚀 How to Run the Project
+## 🛠️ Modular Tool Architecture (`tools.py`)
 
-### Prerequisites
-* Python 3.10+
-* Virtual Environment (e.g., `aml_env`)
+1. **`run_eda_tool`**: Performs baseline statistical analysis (total volume, transaction count, average amount).
+2. **`feature_engineering_tool`**: Computes per-account aggregations (`tx_count`, `total_volume`, `avg_amount`, `max_amount`, `std_amount`), structuring band counts ($9k–$9.99k), near-threshold ratios, and z-score velocity metrics. Operates in full-dataset or single-account mode.
+3. **`detect_structuring_tool`**: Rule-based detection uncovering accounts executing 3+ transfers between $9,000 and $9,999.99.
+4. **`detect_layering_tool`**: Pattern detector identifying rapid pass-through transfers and fan-out split behaviors.
+5. **`risk_classification_tool`**: **Hybrid Scoring Engine** combining Scikit-Learn `IsolationForest` ML anomaly scores with rule hits to assign `Low`, `Medium`, or `High` risk with explicit threshold explanations.
 
-### 1. Install Dependencies
+---
+
+## 💻 Tech Stack
+
+* **Orchestration**: LangGraph (`StateGraph`, conditional edges)
+* **LLM Engine**: Google Gemini (`gemini-flash-latest`) via `langchain-google-genai`
+* **Machine Learning & Analytics**: Scikit-Learn (`IsolationForest`), Pandas, NumPy
+* **User Interface**: Streamlit (High-contrast corporate financial theme)
+* **Environment Management**: Python 3.10+, `python-dotenv`
+
+---
+
+## 🚀 Setup & Usage Instructions
+
+### 1. Clone & Setup Virtual Environment
 ```bash
-pip install streamlit pandas scikit-learn langchain-google-genai langgraph python-dotenv
+git clone <repository_url>
+cd AML-Intelligent-Agent-Version-0
+python -m venv aml_env
+aml_env\Scripts\activate  # Windows
+# source aml_env/bin/activate # Linux/Mac
 ```
 
-### 2. Configure Environment Variables
-Create a `.env` file in the root directory:
+### 2. Install Dependencies
+```bash
+pip install streamlit pandas numpy scikit-learn langchain-google-genai langgraph python-dotenv
+```
+
+### 3. Configure API Key
+Create a `.env` file in the project root:
 ```env
-GOOGLE_API_KEY=your_google_ai_studio_api_key_here
+GOOGLE_API_KEY=your_google_ai_studio_api_key
 ```
 
-### 3. Generate Dataset (Optional)
+### 4. Regenerate Synthetic Dataset (Optional)
 ```bash
 python generate_data.py
 ```
 
-### 4. Run Agent via CLI Test
+### 5. Run Terminal CLI Benchmark Test
 ```bash
 python agent.py
 ```
 
-### 5. Launch Executive Web Dashboard
+### 6. Launch Executive Web Dashboard
 ```bash
 streamlit run app.py
 ```
 
 ---
 
-## 🔒 Security & Compliance Standards
-* Environment variables isolated via `.env` and `.gitignore`.
-* Model configurations optimized for `gemini-flash-latest`.
-* Audit-ready narrative formatting following standard BSA/FinCEN SAR review workflows.
+## 🔍 Benchmark Query Matrix (Demonstrating Adaptive Behavior)
+
+| Query | Parsed Intent | Invoked Tools | Skipped Tools | Reasoning / Output |
+| :--- | :--- | :--- | :--- | :--- |
+| *"Find structuring patterns in the last 30 days"* | `pattern_detection` | `feature_engineering`, `pattern_detection`, `risk_classification` | `eda` | Focuses on sub-threshold CTR evasion. Skips broad EDA. Outputs top high-risk smurfing accounts and recommends SAR filing. |
+| *"Which customers made 10+ transactions under $10,000?"* | `aggregation_rule` | `feature_engineering` | `eda`, `pattern_detection`, `risk_classification` | Deterministic rule query. Invokes feature engineering only, skipping ML anomaly detection & EDA. |
+| *"Is customer ID ACC_SMURF_9003 suspicious?"* | `single_entity` | `feature_engineering`, `risk_classification` | `eda`, `pattern_detection` | Targeted entity lookup. Extracts single-account features and hybrid risk score (`HIGH RISK`, score 0.95). |
+
+---
+
+## 🤖 Mandatory Disclosures (APIs & AI Assistance)
+
+In accordance with hackathon submission guidelines:
+* **LLM API**: This project uses the **Google Gemini API** (`gemini-flash-latest`) via the `langchain-google-genai` SDK.
+* **AI Coding Assistance**: Development of this project was assisted by **Antigravity (Google DeepMind Agentic Coding Assistant)** using Gemini 3.1 Pro and Gemini 3.6 Flash for code refactoring, tool integration, and UI styling.
