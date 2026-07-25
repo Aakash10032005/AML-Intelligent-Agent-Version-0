@@ -20,6 +20,7 @@ api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("google_api_key")
 if not api_key:
     raise ValueError("GOOGLE_API_KEY not found in environment variables. Check your .env file!")
 
+
 # 1. State Definition
 class AgentState(TypedDict):
     user_query: str
@@ -32,13 +33,15 @@ class AgentState(TypedDict):
     final_explanation: str
     execution_summary: str
 
+
 # Helper to initialize LLM
 def get_llm():
     return ChatGoogleGenerativeAI(
-        model="gemini-flash-latest",
+        model="gemini-2.5-flash",   # pinned, stable — NOT "gemini-flash-latest"
         temperature=0,
         google_api_key=api_key
     )
+
 
 # 2. Node: Dynamic Query Planner
 def parse_query_node(state: AgentState):
@@ -47,7 +50,7 @@ def parse_query_node(state: AgentState):
     Determines intent, target pattern, filters, required modules, tools to invoke, and skip reasons.
     """
     llm = get_llm()
-    
+
     prompt = f"""
     You are an expert Anti-Money Laundering (AML) Compliance Agent and Planner.
     Analyze the user's natural language query and construct a dynamic execution plan.
@@ -74,6 +77,11 @@ def parse_query_node(state: AgentState):
       "reasoning": "one sentence explaining why these specific tools were chosen and why others were skipped"
     }}
 
+    IMPORTANT: For aggregation_rule intent queries that state an explicit count/threshold
+    (e.g. "10+ transactions under $10,000"), you MUST populate both "min_transaction_count"
+    and "amount_max" in filters so the feature_engineering tool can answer the query directly
+    without needing ML anomaly detection.
+
     FEW-SHOT EXAMPLES:
     Example 1: "Find structuring patterns in the last 30 days"
     -> intent: "pattern_detection", target_pattern: "structuring", filters: {{date_range: {{start: "2025-06-25", end: "2025-07-25"}}}}, requires_eda: false, requires_feature_engineering: true, requires_anomaly_detection: true, requires_risk_classification: true, tools_to_invoke: ["feature_engineering", "pattern_detection", "risk_classification"], needs_clarification: false, reasoning: "Targeted pattern detection query skips broad EDA to focus on feature extraction, structuring detection, and risk scoring."
@@ -89,18 +97,18 @@ def parse_query_node(state: AgentState):
 
     User Query: "{state['user_query']}"
     """
-    
+
     try:
         response = llm.invoke(prompt)
         content = response.content.strip()
-        
+
         # Clean JSON markdown fences if present
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
         content = content.strip()
-        
+
         plan = json.loads(content)
     except Exception:
         # Fallback plan if JSON parsing fails
@@ -131,12 +139,14 @@ def parse_query_node(state: AgentState):
         "tool_outputs": []
     }
 
+
 # 3. Router Edge Function
 def route_after_parse(state: AgentState):
     """Routes execution based on whether human clarification is needed or tool execution should start."""
     if state.get("needs_clarification", False):
         return "human_clarification"
     return "execute_tools_pipeline"
+
 
 # 4. Node: Human-in-the-loop Clarification
 def clarification_node(state: AgentState):
@@ -147,35 +157,77 @@ def clarification_node(state: AgentState):
         "execution_summary": f"**QUERY**: \"{state['user_query']}\"\n**STATUS**: Awaiting Clarification (Ambiguous Input)"
     }
 
+
 # 5. Pipeline Node: Execute Planned Tools
 def execute_tools_node(state: AgentState):
     plan = state.get("plan", {})
     tools_to_run = plan.get("tools_to_invoke", [])
-    filters = plan.get("filters", {})
+    filters = plan.get("filters", {}) if isinstance(plan.get("filters"), dict) else {}
     target_pattern = plan.get("target_pattern", "none")
-    acc_id = filters.get("account_id") if isinstance(filters, dict) else None
+
+    acc_id = filters.get("account_id")
+    date_range = filters.get("date_range", {}) if isinstance(filters.get("date_range"), dict) else {}
+    date_start = date_range.get("start")
+    date_end = date_range.get("end")
+    amount_min = filters.get("amount_min")
+    amount_max = filters.get("amount_max")
+    min_tx_count = filters.get("min_transaction_count")
+    tx_type = filters.get("transaction_type")
 
     outputs = []
 
-    # Modular execution of invoked tools
+    # Modular execution of invoked tools, with planner filters threaded through
     if "eda" in tools_to_run:
-        outputs.append(f"--- EDA MODULE OUTPUT ---\n" + run_eda_tool.invoke({"query": "all"}))
-        
+        outputs.append(
+            "--- EDA MODULE OUTPUT ---\n" +
+            run_eda_tool.invoke({"query": "all", "date_start": date_start, "date_end": date_end})
+        )
+
     if "feature_engineering" in tools_to_run:
         param = acc_id if acc_id else "all"
-        outputs.append(f"--- FEATURE ENGINEERING OUTPUT ---\n" + feature_engineering_tool.invoke({"account_id": param}))
-        
+        outputs.append(
+            "--- FEATURE ENGINEERING OUTPUT ---\n" +
+            feature_engineering_tool.invoke({
+                "account_id": param,
+                "date_start": date_start,
+                "date_end": date_end,
+                "amount_min": amount_min,
+                "amount_max": amount_max,
+                "transaction_type": tx_type,
+                "min_transaction_count": min_tx_count,
+            })
+        )
+
     if "pattern_detection" in tools_to_run:
         if target_pattern == "layering":
-            outputs.append(f"--- LAYERING PATTERN DETECTION OUTPUT ---\n" + detect_layering_tool.invoke({"query": "all"}))
+            outputs.append(
+                "--- LAYERING PATTERN DETECTION OUTPUT ---\n" +
+                detect_layering_tool.invoke({
+                    "query": "all", "date_start": date_start, "date_end": date_end
+                })
+            )
         else:
-            outputs.append(f"--- STRUCTURING PATTERN DETECTION OUTPUT ---\n" + detect_structuring_tool.invoke({"timeframe": "30 days"}))
+            outputs.append(
+                "--- STRUCTURING PATTERN DETECTION OUTPUT ---\n" +
+                detect_structuring_tool.invoke({
+                    "date_start": date_start, "date_end": date_end
+                })
+            )
 
     if "risk_classification" in tools_to_run:
         param = acc_id if acc_id else "all"
-        outputs.append(f"--- HYBRID RISK CLASSIFICATION OUTPUT ---\n" + risk_classification_tool.invoke({"account_id": param, "target_pattern": target_pattern}))
+        outputs.append(
+            "--- HYBRID RISK CLASSIFICATION OUTPUT ---\n" +
+            risk_classification_tool.invoke({
+                "account_id": param,
+                "target_pattern": target_pattern,
+                "date_start": date_start,
+                "date_end": date_end,
+            })
+        )
 
     return {"tool_outputs": outputs}
+
 
 # 6. Node: Query-Aware Compliance Memorandum Generator
 def explanation_node(state: AgentState):
@@ -183,9 +235,9 @@ def explanation_node(state: AgentState):
     tools_invoked = state.get("invoked_tools", [])
     tools_skipped = state.get("skipped_tools", [])
     outputs = "\n\n".join(state.get("tool_outputs", []))
-    
+
     llm = get_llm()
-    
+
     prompt = f"""
     You are a Senior Bank AML Compliance Officer preparing a formal Incident Memorandum.
     Synthesize the original query, dynamic execution plan, and tool analytical outputs into a professional regulatory memorandum.
@@ -206,7 +258,7 @@ def explanation_node(state: AgentState):
        - LOW RISK -> Recommend standard monitoring with no immediate escalation.
     4. Format using clean GitHub-style Markdown with clear headings and bullet points.
     """
-    
+
     try:
         res = llm.invoke(prompt)
         explanation_text = res.content
@@ -217,15 +269,21 @@ def explanation_node(state: AgentState):
                     text_content += block["text"]
             explanation_text = text_content if text_content else str(explanation_text)
     except Exception as e:
-        explanation_text = f"### AML Incident Analysis Summary\n\n**Query Analyzed**: {state['user_query']}\n\n**Tool Output Analysis**:\n{outputs}\n\n**Escalation Recommendation**: Review high-risk accounts and assess for SAR filing with FinCEN."
+        explanation_text = (
+            f"### AML Incident Analysis Summary\n\n"
+            f"**Query Analyzed**: {state['user_query']}\n\n"
+            f"**Tool Output Analysis**:\n{outputs}\n\n"
+            f"**Escalation Recommendation**: Review high-risk accounts and assess for SAR filing with FinCEN."
+        )
 
     # Format Query-Aware Execution Summary Header
     summary_header = format_execution_summary(state)
-    
+
     return {
         "final_explanation": str(explanation_text),
         "execution_summary": summary_header
     }
+
 
 # Helper: Build Query-Aware Execution Summary
 def format_execution_summary(state: AgentState) -> str:
@@ -249,6 +307,7 @@ TOOLS INVOKED: {invoked_str}
 TOOLS SKIPPED: {skipped_str}
 PLANNER REASONING: {reasoning}
 ```"""
+
 
 # --- BUILD LANGGRAPH WORKFLOW ---
 workflow = StateGraph(AgentState)
@@ -287,12 +346,12 @@ if __name__ == "__main__":
         "Which customers made 10+ transactions under $10,000?",
         "Is customer ID ACC_SMURF_9003 suspicious?"
     ]
-    
+
     for query in test_queries:
-        print(f"\n" + "="*60)
+        print(f"\n" + "=" * 60)
         print(f"TESTING QUERY: {query}")
-        print("="*60)
-        
+        print("=" * 60)
+
         result = aml_agent.invoke({"user_query": query})
         print(result['execution_summary'])
         print("\n--- INCIDENT MEMORANDUM ---")
