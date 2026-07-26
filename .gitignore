@@ -1,3 +1,5 @@
 .env
 __pycache__/
+demo_automation.py
+demo_video_script.md
 
