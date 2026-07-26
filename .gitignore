@@ -3,3 +3,15 @@ __pycache__/
 demo_automation.py
 demo_video_script.md
 
+aml_demo_voiceover_full.mp3
+generate_voiceover.py
+audio_scenes/scene1_hook.mp3
+audio_scenes/scene2_architecture_structuring.mp3
+audio_scenes/scene3_audit_ml_scoring.mp3
+audio_scenes/scene4_memo_sar_export.mp3
+audio_scenes/scene5_db_sync_conclusion.mp3
+VIDEO DEMO/AML Surveillance v4.1 - Google Chrome 2026-07-26 16-11-47.mp4
+create_presentation.py
+presentation_outline.md
+VIDEO DEMO + PPT/AML Surveillance v4.1 - Google Chrome 2026-07-26 16-11-47.mp4
+VIDEO DEMO + PPT/AML_Surveillance_Engine_Presentation.pptx
