@@ -43,12 +43,11 @@ def get_llm():
     )
 
 
-# 2. Node: Dynamic Query Planner with Guaranteed Routing Override
+# 2. Node: Dynamic Query Planner with Accurate Account & Intent Parsing
 def parse_query_node(state: AgentState):
     llm = get_llm()
     query_lower = state['user_query'].lower()
 
-    # Deterministic Pre-Check to guarantee non-EDA routing on specific keywords
     forced_tools = None
     forced_intent = None
     forced_pattern = "none"
@@ -64,13 +63,13 @@ def parse_query_node(state: AgentState):
     elif any(k in query_lower for k in ["account", "acc_", "customer", "audit"]):
         forced_tools = ["feature_engineering", "risk_classification"]
         forced_intent = "single_entity"
-    elif any(k in query_lower for k in ["threshold", "transactions under", "made"]):
-        forced_tools = ["feature_engineering"]
-        forced_intent = "aggregation_rule"
+    elif any(k in query_lower for k in ["volume", "summary", "eda", "overview", "transaction type"]):
+        forced_tools = ["eda"]
+        forced_intent = "eda"
 
     prompt = f"""
     You are an expert Anti-Money Laundering (AML) Compliance Agent and Planner.
-    Analyze the user's natural language query and construct a dynamic execution plan.
+    Analyze the user's natural language query and extract filters (especially account IDs like ACC_3127 if present).
 
     Respond ONLY with a valid JSON block containing these exact keys:
     {{
@@ -78,53 +77,56 @@ def parse_query_node(state: AgentState):
       "target_pattern": "structuring | smurfing | layering | none",
       "filters": {{
         "date_range": {{"start": null, "end": null}},
-        "account_id": null,
+        "account_id": "Extract exact account ID if present e.g. ACC_3127 or null",
         "transaction_type": null,
         "amount_min": null,
         "amount_max": null,
         "min_transaction_count": null
       }},
-      "requires_eda": false,
-      "requires_feature_engineering": true,
-      "requires_anomaly_detection": true,
-      "requires_risk_classification": true,
-      "tools_to_invoke": ["feature_engineering", "pattern_detection", "risk_classification"],
+      "tools_to_invoke": ["feature_engineering", "risk_classification"],
       "needs_clarification": false,
       "clarifying_question": null,
-      "reasoning": "string explaining tool choices"
+      "reasoning": "string explaining choices"
     }}
 
     User Query: "{state['user_query']}"
     """
 
-    content = ""  # <--- Safe initialization prevents unbound local variable error
+    content = ""
     plan = {}
 
     try:
         response = llm.invoke(prompt)
         content = response.content.strip()
-
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-
         plan = json.loads(content)
     except Exception as e:
-        print(f"Parser Error: {e} | Content: {content}")
+        print(f"Parser Error: {e}")
 
-    # Apply strict heuristic overrides if LLM defaulted to EDA incorrectly
+    # Fallback / Overrides
     if forced_tools:
         plan["tools_to_invoke"] = forced_tools
         plan["intent"] = forced_intent
         plan["target_pattern"] = forced_pattern
-    elif not plan.get("tools_to_invoke") or plan.get("tools_to_invoke") == ["eda"]:
-        if "eda" not in query_lower and "overview" not in query_lower and "summary" not in query_lower:
-            plan["tools_to_invoke"] = ["feature_engineering", "risk_classification"]
-            plan["intent"] = "single_entity"
+    elif not plan.get("tools_to_invoke"):
+        plan["tools_to_invoke"] = ["eda"]
+        plan["intent"] = "eda"
+
+    # Ensure account_id is dynamically parsed from query text if LLM missed it
+    if "filters" not in plan or not isinstance(plan["filters"], dict):
+        plan["filters"] = {}
+    
+    if not plan["filters"].get("account_id"):
+        for word in state['user_query'].split():
+            if word.upper().startswith("ACC_"):
+                plan["filters"]["account_id"] = word.strip(".,!?")
+                break
 
     all_possible = ["eda", "feature_engineering", "pattern_detection", "risk_classification"]
-    invoked = plan.get("tools_to_invoke", ["feature_engineering", "risk_classification"])
+    invoked = plan.get("tools_to_invoke", ["eda"])
     skipped = [t for t in all_possible if t not in invoked]
 
     return {
@@ -153,7 +155,7 @@ def clarification_node(state: AgentState):
     }
 
 
-# 5. Pipeline Node: Execute Planned Tools
+# 5. Pipeline Node: Execute Planned Tools Dynamically
 def execute_tools_node(state: AgentState):
     plan = state.get("plan", {})
     tools_to_run = plan.get("tools_to_invoke", [])
@@ -179,7 +181,7 @@ def execute_tools_node(state: AgentState):
     if "eda" in tools_to_run:
         outputs.append(
             "--- EDA MODULE OUTPUT ---\n" +
-            run_eda_tool.invoke({"query": "all", "date_start": str(date_start), "date_end": str(date_end)})
+            run_eda_tool.invoke({"query": state['user_query'], "date_start": str(date_start), "date_end": str(date_end)})
         )
 
     if "feature_engineering" in tools_to_run:
@@ -199,7 +201,7 @@ def execute_tools_node(state: AgentState):
         if target_pattern == "layering":
             outputs.append(
                 "--- LAYERING PATTERN DETECTION OUTPUT ---\n" +
-                detect_layering_tool.invoke({"query": "all", "date_start": str(date_start), "date_end": str(date_end)})
+                detect_layering_tool.invoke({"query": state['user_query'], "date_start": str(date_start), "date_end": str(date_end)})
             )
         else:
             outputs.append(
@@ -222,7 +224,7 @@ def execute_tools_node(state: AgentState):
     return {"tool_outputs": outputs}
 
 
-# 6. Node: Query-Aware Compliance Memorandum Generator
+# 6. Node: Query-Aware Compliance Memorandum Generator with Strict Markdown Sanitization
 def explanation_node(state: AgentState):
     plan = state.get("plan", {})
     tools_invoked = state.get("invoked_tools", [])
@@ -231,7 +233,7 @@ def explanation_node(state: AgentState):
 
     prompt = f"""
     You are a Senior Bank AML Compliance Officer preparing a formal Incident Memorandum.
-    Synthesize the raw analytical tool outputs below into a professional, clean executive report.
+    Synthesize the raw analytical tool outputs below directly answering the user's specific query.
 
     Original Query: "{state['user_query']}"
     Planner Intent: {plan.get('intent')}
@@ -242,9 +244,9 @@ def explanation_node(state: AgentState):
     {outputs}
 
     STRICT FORMATTING RULES:
-    1. CRITICAL: When writing account IDs (e.g., ACC_SMURF_9801), you MUST use a backslash before every underscore (write them as ACC\_SMURF\_9801) or wrap them in code blocks (`ACC_SMURF_9801`) so Markdown does not break them into italics.
-    2. Remove all technical wrapper tags like 'FEATURE ENGINEERING OUTPUT' or 'HYBRID RISK CLASSIFICATION OUTPUT'.
-    3. Structure the response cleanly with clear Markdown headings, bullet points, and an explicit **Escalation Recommendation** (High/Medium/Low Risk SAR or EDD advice).
+    1. NEVER use raw math/LaTeX underscores for account IDs. Enclose all account IDs in standard code blocks (e.g., `ACC_3127` or `ACC_SMURF_9801`) so Markdown does not break.
+    2. Completely strip out raw headers like 'FEATURE ENGINEERING OUTPUT' or 'HYBRID RISK CLASSIFICATION OUTPUT'. Replace them with clean executive sections.
+    3. Write a concise **Plain English Summary** directly addressing the query, followed by bullet points of findings and an explicit **Escalation Recommendation**.
     """
 
     try:
@@ -255,9 +257,6 @@ def explanation_node(state: AgentState):
     except Exception:
         explanation_text = f"### AML Incident Summary\n\n{outputs}"
 
-    # Double insurance: replace raw account underscores with safe escaped versions globally if any slip through
-    explanation_text = str(explanation_text).replace("ACC_SMURF_", "ACC\\_SMURF\\_").replace("ACC_LAYER_", "ACC\\_LAYER\\_")
-
     summary_header = f"""```text
 QUERY: "{state['user_query']}"
 DETECTED INTENT: {plan.get('intent', 'Unknown')} (target_pattern: {plan.get('target_pattern', 'none')})
@@ -267,7 +266,7 @@ TOOLS SKIPPED: {', '.join(state.get('skipped_tools', []))}
 PLANNER REASONING: {plan.get('reasoning', 'N/A')}
 ```"""
 
-    return {"final_explanation": explanation_text, "execution_summary": summary_header}
+    return {"final_explanation": str(explanation_text), "execution_summary": summary_header}
 
 
 # --- BUILD LANGGRAPH WORKFLOW ---
