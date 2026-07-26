@@ -5,6 +5,12 @@ from sklearn.ensemble import IsolationForest
 
 DATA_PATH = "data/transactions.csv"
 
+def get_csv_path():
+    # Checks multiple common locations so it never fails
+    for path in ["transactions.csv", "data/transactions.csv", "../transactions.csv", "../data/transactions.csv"]:
+        if os.path.exists(path):
+            return path
+    return "transactions.csv" # Default fallback
 
 def _apply_common_filters(df, date_start=None, date_end=None,
                            amount_min=None, amount_max=None, transaction_type=None):
